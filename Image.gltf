@@ -1,0 +1,482 @@
+
+/*
+
+A demonstration of 
+
+Alexander Reshetov and David Hart. 2024. Modeling Hair Strands with Roving Capsules.
+In Special Interest Group on Computer Graphics and Interactive
+Techniques Conference (SIGGRAPH ’24), July 27-August 1, 2024,
+Denver, CO, USA. ACM, New York, NY, USA,
+9 pages. https://doi.org/10.1145/3641519.3657450
+
+
+See the function traceCurve() and it's dependencies for the complete Rocaps algorithm
+Everything else is optional UI + texture handling.
+
+There are several pre-defined examples to try
+Go to the "Common" tab and change EXAMPLE (don't forget to rewind)
+
+Movement keys: W,A,S,D,Q,E  Mouse: drag a control point to move it, drag elsewhere to rotate view
+
+Note this demo uses one of two makeshift methods for texturing. 
+Both of these methods can exhibit artifacts, such as texture twisting or flipping, depending on the curve.
+We included textuing because it is nice to have, however keep in mind that 
+texturing is orthogonal to the Roving Capsules algorithm, and is not required.
+Better curve texturing methods are known. 
+For an example of Roving Capsules using "Wang RMF", see
+https://www.shadertoy.com/view/M3d3WM
+
+*/
+
+
+// Use Rocaps if SPLITS == 0, otherwise use uniform capsules with h = 1/SPLITS
+#define SPLITS 0
+
+
+// visualization options
+const bool SHOW_CAPSULES       = bool(0); // show capsule components
+const bool TEXTURING           = bool(1); // add texture (demo use of {alpha, curve.u})
+const bool DELINEARIZE         = bool(1); // use more accurate surface normals
+const bool USE_CAPSULE_NORMALS = bool(0); // use capsule normals (instead of strand normals)
+const bool SHOW_ITERS          = bool(0);
+const bool SHOW_EARLY_EXIT     = bool(0);
+const bool SHOW_BUFA           = bool(0);
+
+
+// Antialiasing level
+const int sqrt_SPP = 2;  // sqrt_SPP * sqrt_SPP samples per pixel
+
+
+// Choice of basis for texturing (see top comment for alternatives)
+// 0: Use orthonormal basis of curve'(0.5) https://jcgt.org/published/0006/01/01/
+// 1: Frenet using https://en.wikipedia.org/wiki/Frenet%E2%80%93Serret_formulas
+const bool Frenet_Serret = bool(1);
+
+
+// intersect ray with capsule
+// capsule is in ray-centric coords, i.e. ray is origin:(0,0,0) direction:(0,0,1)
+bool capsule_intersection( vec4 pa, vec4 pb, float ray_tmax, out float t, out float u ) {
+    vec2  Q        = pa.xy;                      // pa - ray origin; push ray close to capsule
+    vec2  A        = pb.xy - Q;                  // axis vector
+    float dr       = pb.w - pa.w;
+    float au_e     = dr * dr - dot(A, A);
+    float Az       = pb.z - pa.z;
+    float e        = Az * Az - au_e;
+    float f        = dot(A, Q) - pa.w * dr;
+    float g        = dot(Q, Q) - pa.w * pa.w;
+    
+    float udisc    = ( f * f + g * au_e ) / e;
+    if( udisc < 0. ) return false;
+    
+    float squdisc  = Az * sqrt( udisc );
+    float u0       = ( f + squdisc ) / au_e;
+    float u1       = ( f - squdisc ) / au_e;
+    if( u0 * dr < -pa.w ) u0 = 1.0 - u0;         // flip negative caps to other side
+    if( u1 * dr < -pa.w ) u1 = 1.0 - u1;
+    
+    float umin     = clamp(Az >= 0.0 != u1 > u0 ? u1 : u0, 0., 1.);
+    float tdisc    = umin * (umin * au_e - 2.0 * f) - g;
+    if( tdisc < 0.0 ) return false;
+    
+    t = Az * umin - sqrt( tdisc ) + pa.z;        // pa.z compensates for Q.z
+    u = umin;
+    return ( t > 0.0 && t <= ray_tmax );
+}
+
+vec4 position( mat4 p, in float u ) {
+    float uu = u * u;
+    float u3 = ( 1.0 / 6.0 ) * uu * u;
+    return p[0] + ( u3 + 0.5 * ( u - uu ) ) * p[1] + ( uu - 4.0 * u3 ) * p[2] + u3 * p[3];
+}
+float position( vec4 q, in float u ) {
+    float uu = u * u;
+    float u3 = ( 1.0 / 6.0 ) * uu * u;
+    return q.x + ( u3 + 0.5 * ( u - uu ) ) * q.y + ( uu - 4.0 * u3 ) * q.z + u3 * q.w;
+}
+vec4 velocity( mat4 p, in float u ) {
+    float v = 1.0 - u;
+    return 0.5 * v * v * p[1] + 2.0 * v * u * p[2] + 0.5 * u * u * p[3];
+}
+vec4 acceleration( mat4 p, in float u ) {
+    return 2.0 * p[2] - p[1] + ( p[1] - 4.0 * p[2] + p[3] ) * u;
+}
+vec4 jerk( mat4 p ) {
+    return p[1] - 4.0 * p[2] + p[3];
+}
+
+// CoefficientList[p0 + u*(p1/2 + u*((p2 - p1/2) + u*(p1 - 4*p2 + p3)/6)), u]
+float L1_norm( in vec4 v )     { return abs( v.x ) + abs( v.y ) + abs( v.z );    }
+float velocity_a    ( mat4 p ) { return L1_norm( p[1] );                         }
+float acceleration_a( mat4 p ) { return L1_norm( 2. * p[2] - p[1] );             }
+float jerk_a        ( mat4 p ) { return L1_norm( p[1] + p[3] - 4. * p[2] ) / 3.; }
+float radius_a      ( mat4 p ) { return abs( 2. * p[2].w - p[1].w );             }
+float avg_radius( mat4 p ) { 
+    return p[0].w + p[1].w / 8. + p[2].w / 6. + p[3].w / 24.;  // integral(0,1)
+}
+
+float capsule_step( mat4 p, in float rdlen ) {
+#if SPLITS > 0
+    return 1.0 / float( SPLITS );
+#else
+    float minh = 1.0 / 50.0, maxh = 1.0 / 4.0;
+    float vel = velocity_a( p );
+    float du  = vel / ( acceleration_a( p ) + jerk_a( p ) );
+    du *= min( 1.0, 0.5 / radius_a( p ) );
+    du = minh * ( 1.0 + du );
+    du *= clamp( rdlen / vel, 0.05, 3.0 );
+    du = min( du, 20.0 * avg_radius( p ) / vel );
+    du = max( min( du, maxh ), 0.1 * minh );
+    return du;
+#endif
+}
+
+float capsule_error( mat4 curve, in vec3 raypos, in float u ) {
+    // dot(given raypos - adjusted_curve_pos, velocity)
+    vec4  c04 = position( curve, u );
+    vec4  c14 = velocity( curve, u );
+    vec3  c0  = vec3( c04 );
+    vec3  c1  = vec3( c14 );
+    float r0  = c04.w;  // radius
+    float r1  = c14.w;  // its derivative
+    return dot( raypos - c0, c1 ) + r0 * r1;
+}
+
+float capsule_tune( mat4 curve, in vec3 raypos, in vec3 rd, in float us ) {
+    // this function assumes that raypos is on the surface and tunes us
+    if (!DELINEARIZE) return us;
+
+    float u0 = us, u1, f0, f1;
+    float c  = 1.;  // dot(rd, rd);
+    float h  = 0.;  // u1 = u0 at first iteration
+    for( int nrep = 0; nrep <= 3; nrep++ ) {
+        u1 = u0 + h;
+        f1 = capsule_error( curve, raypos, u1 );
+        if( h == 0. ) {
+            h = 0.1 * capsule_step( curve, c );  // 3*0.1 = 30% of capsule length
+            if( f1 < 0. ) h = -h;
+        } else {
+            if( f1 > 0. != f0 > 0. ) {
+                // intercept[{u0,u1}, {f0,f1}]
+                u0 = ( f0 * u1 - f1 * u0 ) / ( f0 - f1 );
+                u0 = clamp( u0, 0., 1. );
+                break;
+            } else if( abs( f1 ) > abs( f0 ) ) {
+                return us;  // something is wrong, restore the original value
+            }
+        }
+        u0 = u1;
+        f0 = f1;
+    }
+    return u0;
+}
+
+float cubic_value       ( vec4 q, in float u ) { return q.x + u * ( q.y + u * ( q.z + q.w * u ) ); }
+float cubic_velocity    ( vec4 q, in float u ) { return q.y + u * ( 2. * q.z + 3. * u * q.w );     }
+float cubic_acceleration( vec4 q, in float u ) { return 2. * q.z + 6. * u * q.w;                   }
+
+float approximate_conservative_root( vec4 cubic, in float us, in float ue ) {
+    float f0         = cubic_value( cubic, us );
+    float f1         = cubic_velocity( cubic, us );
+    bool  convex     = cubic_acceleration( cubic, us ) > 0.;
+    float inflection = ( -1.0 / 3. ) * cubic.z / cubic.w;
+    bool  consistent = inflection < us || inflection > ue;
+    if( convex && f1 < 0. ) {
+        float un = us - f0 / f1;
+        if( consistent || un < inflection ) return un;
+    } else if( consistent ) {
+        if( convex ) return ue;
+        inflection = ue;
+    }
+
+    float ul, ur, fi, fl, fr;
+    fi = cubic_value( cubic, inflection );
+    if( fi < 0. ) {
+        ul = us;
+        ur = inflection;
+        fl = f0; fr = fi;
+    } else if( consistent ) {
+        return ue;
+    } else if( !convex ) {
+        f1 = cubic.y + cubic.z * inflection;
+        if( f1 > 0. ) return ue;
+        return inflection - fi / f1;
+    } else {
+        fr = cubic_value( cubic, ue );
+        if( fr > 0. ) return ue;
+        ul = inflection;
+        ur = ue; fl = fi;
+    }
+
+    // secant(ul, Newton(ur))
+    ur -= fr / cubic_velocity( cubic, ur );
+    fr  = cubic_value( cubic, ur );
+    return (fr*ul - fl*ur)/(fr - fl);
+}
+
+float tightenInterval( mat4 p, vec4 sn, in float us, in float ue ) {
+    // n.xyz = sn - (ro + (sn - ro).rd * rd)
+    float nn = sn.x * sn.x + sn.y * sn.y;
+    if( nn < sn.w * sn.w ) return us; // ray intersects sphere(us)
+    float nl  = 1.0 / sqrt( nn );  // g(u) = dot(position(u), n)
+    vec4  n   = vec4( sn.x * nl, sn.y * nl, 0., -1. );
+    float p1n = dot( p[1], n ), p2n = dot( p[2], n ), p3n = dot( p[3], n );
+    vec4  cubic;
+    cubic.x = dot( p[0], n );  // convert internal layout to cubic
+    cubic.y = p1n / 2.;
+    cubic.z = p2n - cubic.y;
+    cubic.w = ( p1n - 4. * p2n + p3n ) / 6.;
+    return approximate_conservative_root( cubic, us, ue );
+}
+
+float minRoot( vec4 px, in float t0, in float t1 ) {
+    // f' = a + 2 b t - c t^2
+    float a = px.y;
+    float b = 2.0 * px.z - a;
+    float c = 2.0 * px.z + b - px.w;
+    float det = b * b + a * c;
+
+    if( det <= 0.0 ) return -1.0;
+
+    float root1, root2;
+    det = sqrt( det );
+    if( a < 0.0 ) det = -det;
+    det   = a == 0.0 ? -b : c == 0.0 ? b : det;
+    root1 = ( b * det <= 0.0 ) ? ( b - det ) / c : -a / ( b + det );
+    root2 = -a / ( root1 * c );  // Vieta
+    // we choose the root for which f'' > 0 (i.e. f has a minimum)
+    return det > 0.0 ? root1 : root2;
+}
+
+vec3 ort1( in vec3 rd ) {
+    // following http://jcgt.org/published/0006/01/01/
+    // assuming rd.rd == 1
+    float sign = rd.z >= 0. ? 1. : -1.;
+    float a    = 1. / ( sign + rd.z );
+    float b    = a * rd.x * rd.y;
+    return vec3( a * rd.x * rd.x - sign, b, rd.x );
+}
+
+vec3 ort2( in vec3 rd ) {
+    // could also use cross(ort1(rd), rd)
+    float sign = rd.z >= 0. ? 1. : -1.;
+    float a    = 1. / ( sign + rd.z );
+    float b    = a * rd.x * rd.y;
+    return vec3( b, sign + rd.y * rd.y * a, -rd.y );
+}
+
+bool separated( vec3 rd, float us, float ue, mat4 p0, out mat4 prcc ) {
+    vec3  base        = vec3( velocity( p0, 0.5 ) );
+    vec3  pm          = vec3( position( p0, 0.5 ) );
+    vec3  slab_normal = cross( rd, base );
+    float slab_length = length( slab_normal );
+    if( slab_length < 0.001 ) {
+        slab_normal = ort1( rd );
+        slab_length = 1.;
+    }
+    slab_normal /= slab_length;
+    if( dot( pm, slab_normal ) < 0.0 ) slab_normal = -slab_normal;
+    vec4 pxc = slab_normal * mat4x3(p0); // NOTE_CWD
+    vec4 radii = transpose(p0)[3];
+    vec4 pxw = pxc - radii;
+
+    float px0 = position( pxw, us );
+    float px1 = position( pxw, ue );
+
+    if( px0 >= 0.0 && px1 >= 0.0 ) {
+        float xroot = minRoot( pxw, us, ue );
+        if( xroot < us || xroot > ue || position( pxw, xroot ) >= 0.0 ) return true;
+    }
+
+    // axisx is slab_normal; axisz is rd
+    vec3 axisy = cross( rd, slab_normal );
+
+    prcc = transpose(mat4(pxc, axisy * mat4x3(p0), rd * mat4x3(p0), radii )); // NOTE_CWD
+    return false;
+}
+
+// ray-curve intersection, using the roving capsules algorithm
+// points are in "dc" (internal) ray-relative format, with ray origin = (0,0,0)
+// returns a pair (t,u) where t is the ray hit parameter and u is the curve parameter of the hit point
+// if the ray misses the capsule, then t==inf is returned
+// caphit is true if hitting the sphere of the intersected capsule
+vec2 traceCurve(vec3 rd, mat4 points_dc, 
+    // the following outputs are for demo/debug features (they are optional and can be removed)
+    out int rti, out bool caphit, out vec3 capn, out bool early_exit) 
+{
+    float us = 0.0, ue = 1.0;
+
+    mat4 prcc;
+    early_exit = separated( rd, us, ue, points_dc, prcc );
+    if( early_exit ) return vec2(inf); // miss
+
+    float h = capsule_step( points_dc, 1. );
+    float u0, u1 = us;
+    vec4  p0, p1 = position( prcc, u1 );
+    float ux, tx = inf;
+
+    rti = 0;
+    do {  // go over all unresolved subsegments [u0,u1] in [us,ue]
+        u0 = u1;
+        p0 = p1;
+#if SPLITS == 0
+        float un = tightenInterval( prcc, p0, u0, ue );
+        if( un > u0 ) {                 // successful tightening
+            if( un >= ue ) break;       // no more intersections possible
+            u0 = min( un, ue - h );     // avoid slim capsules
+            p0 = position( prcc, u0 );  // recompute it
+        }
+#endif
+        u1 = min( ue, u0 + h );  // [u0,u1] defines capsule
+        p1 = position( prcc, u1 );
+
+        float uc, tc;
+        if( capsule_intersection( p0, p1, tx, tc, uc ) ) { 
+            tx     = tc;
+            ux     = u0 * ( 1. - uc ) + u1 * uc;
+            caphit = (uc == 0. || uc == 1.); // used if SHOW_CAPSULES == 1
+            if( USE_CAPSULE_NORMALS )   // capsule normal
+                capn = tc * rd - vec3( position( points_dc, u0 ) * ( 1. - uc ) + position( points_dc, u1 ) * uc );
+        }
+        rti++;
+    } while( u1 < ue );
+    
+    return vec2(tx, ux);
+}
+
+vec3 pattern( vec2 uv ) {
+    vec3 col = vec3( 0.6 );
+    col += 0.4 * smoothstep( -0.01, 0.01, cos( uv.x * 0.5 ) * cos( uv.y * 0.5 ) );
+    col *= smoothstep( -1.0, -0.98, cos( uv.x ) ) * smoothstep( -1.0, -0.98, cos( uv.y ) );
+    return col;
+}
+
+void mainImage( out vec4 fragColor, vec2 fragCoord ) {
+    vec2 uv = pixelToScreen(fragCoord.xy, iResolution.xy);
+
+    fragColor = vec4(0,0,0,1);
+    float dx = fwidth(length(uv)) * 0.75;
+
+    // get camera
+    vec3 lookat = texelFetch(iChannel0, ivec2(GROUP_CAM << pxl, 0 << pxl), 0).xyz;
+    vec4 camhvd = texelFetch(iChannel0, ivec2(GROUP_CAM << pxl, 1 << pxl), 0);
+
+    vec3 ro = lookat + camhvd.z * normalize(vec3(
+        sin(camhvd.y)*cos(camhvd.x), 
+        cos(camhvd.y),
+        sin(camhvd.y)*sin(camhvd.x))); 
+
+    // camera basis
+    vec3 lookdir = normalize(lookat - ro);
+    vec3 ww = camhvd.w * lookdir;
+    vec3 uu = normalize( cross( ww, vec3( 0.0, 1.0, 0.0 ) ) );
+    vec3 vv = normalize( cross( uu, ww ) );
+    
+    vec3 wwcenter = ro + ww;
+
+    // load control points
+    vec3 p2[NUM_POINTS]; // xy 2d in screen coords
+    vec4 p3[NUM_POINTS]; // xyzr 3d
+    for (int i = 0; i < NUM_POINTS; i++) {
+        p2[i] = texelFetch(iChannel0, ivec2(GROUP_POINT2 << pxl, i << pxl), 0).xyz;
+        p3[i] = texelFetch(iChannel0, ivec2(GROUP_POINT3 << pxl, i << pxl), 0);
+    }
+
+    // display control points
+    for (int i = 0; i < NUM_POINTS; i++) {
+        if (p2[i].z < 0.) continue;
+		float w = 0.002;
+    	float d = abs(sdCircle(uv.xy, p2[i].xy, POINT_SIZE));
+        float u = float(i) / float(NUM_POINTS);
+    	if (d < w+dx+dx) fragColor += vec4(u,1.-u,1.-u,1) * smoothstep(w+dx, w-dx, d);
+    }
+
+    vec3 tot = vec3( 0.0 );
+
+    mat4 points_bezier = mat4(p3[0], p3[1], p3[2], p3[3]);
+    mat4 points_bezier_rr; // ray-relative bezier control points NOTE_COL
+    for (int i = 0; i < 4; i++) points_bezier_rr[i] = vec4(points_bezier[i].xyz - ro, points_bezier[i].w);
+    
+    const mat4 bezier_to_dcurve = bezier_to_bspline * bspline_to_dcurve; // NOTE_MMR
+    mat4 points_dc = points_bezier_rr * bezier_to_dcurve; // NOTE_MMR
+    
+    for( int m = 0; m < sqrt_SPP; m++ ) {
+        for( int n = 0; n < sqrt_SPP; n++ ) {
+            vec2 oc = (vec2( float( m ), float( n ) ) + 0.5) / float( sqrt_SPP );
+            vec2 pc = fragCoord + oc; // pixel coords
+            vec2 sc = pixelToScreen(pc, iResolution.xy); // screen coords
+
+            // create view ray
+            vec3 rd = normalize( screenToRaydir(sc, uu, vv, ww ) );
+            vec3 col = SHOW_BUFA ? vec3(0) : vec3( 0.02, 0.15, 0.2 ) * 0.5 - 0.2 * rd.y; // background
+      
+            // trace the curve
+            vec3 capn; // valid if USE_CAPSULE_NORMALS is true
+            int rti;
+            bool caphit;
+            bool early_exit = false;
+            vec2 tu = traceCurve(rd, points_dc, rti, caphit, capn, early_exit);
+
+            // if hit, shade the curve
+            if( !early_exit && tu.x != inf ) {
+                float u = tu.y;
+
+                vec3 raypos = tu.x * rd;
+
+                vec3 sn;
+                if( USE_CAPSULE_NORMALS ) {
+                    sn = capn;
+                } else {
+                    if( u != 0. && u != 1. ) u = capsule_tune( points_dc, raypos, rd, u );
+                    sn = raypos - vec3( position( points_dc, u ) );
+                }
+
+                float dn = abs( dot( rd, normalize( sn ) ) );
+                if( SHOW_CAPSULES && caphit ) col = mix( vec3( 0.25, 0.1, 0.2 ), vec3( 1.0, 0.5, 0.2 ), dn );
+                else                          col = mix( vec3( 0.05, 0.1, 0.2 ), vec3( 0.2, 0.5, 1.0 ), dn );
+
+                float world_camlight = 0.3 * pow( dn, 50.0f );
+                col += vec3( world_camlight );
+                vec3 axis1 = normalize( vec3( velocity( points_dc, u ) ) );
+                vec3 axis2;
+                if (Frenet_Serret) {
+                    axis2 = vec3( acceleration( points_dc, u ) );
+                } else {
+                    axis2 = ort1( normalize( vec3( velocity( points_dc, 0.5 ) ) ) );
+                }
+                axis2 = normalize( axis2 - dot( axis1, axis2 ) * axis1 );  // axis2 __| axis1
+                vec3  axis3 = cross( axis1, axis2 );
+                float alpha = dot( axis3, sn );
+                if( alpha != 0. ) alpha = atan( dot( axis2, sn ), alpha );
+                if (!SHOW_CAPSULES && TEXTURING) col *= pattern( vec2( 10. * alpha, 100. * u ) );
+            }
+
+            if (SHOW_ITERS) col = vec3(float(rti) / 30.);
+            if (SHOW_EARLY_EXIT && early_exit ) col *= 0.5;
+
+            tot += col;
+        }
+    }
+    tot /= float( sqrt_SPP * sqrt_SPP );
+        
+    // display the polyline
+    for (int i = 0; i < NUM_POINTS-1; i++) {
+        if (p2[i].z < 0. || p2[i+1].z < 0.) continue;
+        float w = 0.002;
+        float d = sdSegment(uv.xy, p2[i].xy, p2[i+1].xy);
+        if (d < w+dx+dx) tot += vec3(.1) * smoothstep(w+dx, w-dx, d);
+    }
+
+    tot = mix(tot, vec3(-1.0, 0.5, 1.0), PrintValue(fragCoord.xy, vec2(0.0, 2.0), vec2(18.0), capsule_step(points_dc, 1.), 1.0, 3.0));
+
+    // gamma
+    const float exposure = 1.0;
+    tot = sqrt( abs( tot * exposure ) );
+
+    // dither to remove banding the background
+    tot.xyz += fract( sin( fragCoord.x * vec3( 13, 1, 11 ) + fragCoord.y * vec3( 1, 7, 5 ) ) * 158.391832 ) / 255.0;
+    
+    tot            = clamp( tot, 0., 1. );
+    fragColor.xyz += tot ;
+    
+    if (SHOW_BUFA) fragColor += abs(texelFetch(iChannel0, ivec2(fragCoord.xy), 0));
+}
